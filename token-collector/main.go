@@ -34,7 +34,6 @@ import (
 const (
 	maxTokens           = 1250
 	defaultTokens       = 750
-	sendWaitMs          = 7000
 	maxRetries          = 3
 	tokenCollectTimeout = 90 * time.Second
 	zaiURL              = "https://chat.z.ai"
@@ -144,9 +143,14 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	}
 	fmt.Println("  Send clicked")
 
-	// Wait for token endpoint to initialize
-	fmt.Printf("  Waiting %dms for token endpoint...\n", sendWaitMs)
-	time.Sleep(sendWaitMs * time.Millisecond)
+	// Wait for window.z_um.getToken to be ready — the page injects the captcha
+	// SDK async after the first send, so a fixed sleep is flaky under load.
+	fmt.Println("  Waiting for token endpoint...")
+	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer waitCancel()
+	if err := waitForZUM(waitCtx); err != nil {
+		return fmt.Errorf("token endpoint not ready: %w", err)
+	}
 
 	// Collect tokens with timeout
 	fmt.Println("  Collecting tokens...")
@@ -207,6 +211,28 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	fmt.Printf("  Saved: %s (%.1f KB)\n", outPath, sizeKB)
 
 	return nil
+}
+
+// waitForZUM polls until window.z_um.getToken is defined. Z.AI injects the
+// captcha SDK async after the first send; a fixed sleep misses it under load.
+// ponytail: 500ms poll — z_um appears in ~2-5s; 30s deadline (caller) is the ceiling.
+func waitForZUM(ctx context.Context) error {
+	for {
+		var ready bool
+		if err := chromedp.Run(ctx,
+			chromedp.Evaluate(`typeof window.z_um !== 'undefined' && typeof window.z_um.getToken === 'function'`, &ready),
+		); err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // saveTokens creates a SQLite database with the collected tokens.

@@ -289,6 +289,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"activeSessions": s.conversations.count(),
 		"features":       features,
 		"mode":           "direct",
+		"port":           s.cfg.Port,
+		"tokenCount":     s.tokens.Count(),
 	})
 }
 
@@ -503,7 +505,9 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 
-	// No tool calls found
+	// No tool calls found — clean any raw tool-call JSON so the user sees
+	// readable text instead of a JSON dump.
+	content = cleanFallbackContent(content)
 	if req.streamEnabled() {
 		// Client expects SSE — send text as stream chunks
 		flusher, ok := w.(http.Flusher)
@@ -893,12 +897,14 @@ func main() {
 	captchaVerbose = verbose
 
 	// Open token store
+	var tokenCount int
 	tokenStore, err := OpenTokenStore(cfg.DBPath)
 	if err != nil {
 		log.Printf("[Startup] Token store: %v — captcha will fail until tokens.sqlite is available", err)
 		tokenStore = nil
 	} else {
 		defer tokenStore.Close()
+		tokenCount = tokenStore.Count()
 	}
 
 	srv := &Server{
@@ -912,15 +918,15 @@ func main() {
 	printBanner()
 	fmt.Printf(`
 ╔═══════════════════════════════════════════════════════════════╗
-║           Z.AI Direct Bridge Server (Go)                      ║
+║           GLM-ZAI-2API  (Go)                                  ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Mode:          DIRECT HTTP (no browser needed)               ║
 ║  Dashboard:     http://localhost:%s                          ║
 ║  OpenAI API:    http://localhost:%s/v1/chat/completions      ║
-║  Token DB:      %s
+║  Token DB:      %s (%d tokens)
 ║  Auth Token:    %s
 ╚═══════════════════════════════════════════════════════════════╝
-`, cfg.Port, cfg.Port, cfg.DBPath, cfg.AuthToken)
+`, cfg.Port, cfg.Port, cfg.DBPath, tokenCount, cfg.AuthToken)
 
 	// Initialize session (non-blocking on failure — will retry on first request)
 	go func() {

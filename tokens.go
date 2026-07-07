@@ -37,6 +37,17 @@ func (ts *TokenStore) Close() error {
 	return nil
 }
 
+// Count returns the number of tokens currently in the store.
+// Returns 0 if the store is nil or the query fails.
+func (ts *TokenStore) Count() int {
+	if ts == nil || ts.db == nil {
+		return 0
+	}
+	var n int
+	_ = ts.db.QueryRow("SELECT COUNT(*) FROM tokens;").Scan(&n)
+	return n
+}
+
 func (ts *TokenStore) getNext() (string, bool) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()

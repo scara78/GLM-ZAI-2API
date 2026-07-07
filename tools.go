@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 )
@@ -122,31 +123,175 @@ type parsedToolCall struct {
 // 2. <<TOOL>> tags (legacy)
 // 3. Natural language: "create file X with content Y"
 func parseToolCalls(content string, tools []json.RawMessage) []parsedToolCall {
+	schemas := buildSchemaMap(tools)
+
 	// Strategy 1: ```json code blocks
-	if calls := parseJSONToolCalls(content); len(calls) > 0 {
-		return dedupCalls(calls)
+	if calls := filterValidCalls(dedupCalls(parseJSONToolCalls(content)), schemas); len(calls) > 0 {
+		return calls
 	}
 
 	// Strategy 2: Direct JSON object (response is just {"name":"...","arguments":{...}})
-	if calls := parseDirectJSON(content); len(calls) > 0 {
-		return dedupCalls(calls)
+	if calls := filterValidCalls(dedupCalls(parseDirectJSON(content)), schemas); len(calls) > 0 {
+		return calls
 	}
 
 	// Strategy 3: Multi-line JSON (one tool call per line)
-	if calls := parseMultilineJSON(content); len(calls) > 0 {
-		return dedupCalls(calls)
+	if calls := filterValidCalls(dedupCalls(parseMultilineJSON(content)), schemas); len(calls) > 0 {
+		return calls
 	}
 
 	// Strategy 4: <<TOOL>> tags (legacy)
-	if calls := parseTagToolCalls(content); len(calls) > 0 {
-		return dedupCalls(calls)
+	if calls := filterValidCalls(dedupCalls(parseTagToolCalls(content)), schemas); len(calls) > 0 {
+		return calls
 	}
 
 	// Strategy 5: Parse natural language for common patterns
-	if calls := parseNaturalLanguage(content, tools); len(calls) > 0 {
-		return dedupCalls(calls)
+	if calls := filterValidCalls(dedupCalls(parseNaturalLanguage(content, tools)), schemas); len(calls) > 0 {
+		return calls
 	}
 
+	return nil
+}
+
+// buildSchemaMap indexes tool definitions by name → their JSON-Schema "parameters".
+func buildSchemaMap(tools []json.RawMessage) map[string]map[string]interface{} {
+	m := make(map[string]map[string]interface{})
+	for _, raw := range tools {
+		var t struct {
+			Function struct {
+				Name       string                 `json:"name"`
+				Parameters map[string]interface{} `json:"parameters"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(raw, &t) == nil && t.Function.Name != "" {
+			m[t.Function.Name] = t.Function.Parameters
+		}
+	}
+	return m
+}
+
+// filterValidCalls drops tool calls whose arguments violate the tool's schema.
+// GLM emits schema-violating JSON often; forwarding it makes the client reject
+// with SchemaError. Dropping → the response falls back to plain text.
+// Each drop is logged so mis-drops of valid calls are visible.
+func filterValidCalls(calls []parsedToolCall, schemas map[string]map[string]interface{}) []parsedToolCall {
+	var valid []parsedToolCall
+	for _, c := range calls {
+		schema, ok := schemas[c.Function.Name]
+		if !ok {
+			log.Printf("[Tools] drop %q: unknown tool name", c.Function.Name)
+			continue
+		}
+		if schema == nil {
+			valid = append(valid, c) // no params → accept
+			continue
+		}
+		var args interface{}
+		if err := json.Unmarshal([]byte(c.Function.Arguments), &args); err != nil {
+			log.Printf("[Tools] drop %q: arguments not valid JSON: %v", c.Function.Name, err)
+			continue
+		}
+		if verr := validateAgainstSchema(args, schema); verr != nil {
+			log.Printf("[Tools] drop %q: invalid args: %v", c.Function.Name, verr)
+			continue
+		}
+		valid = append(valid, c)
+	}
+	return valid
+}
+
+// cleanFallbackContent replaces a dropped tool-call JSON with a readable
+// message so the user doesn't see raw JSON in the chat. Keeps any readable
+// text the model wrote around it.
+func cleanFallbackContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if looksLikeToolCallJSON(trimmed) {
+		return "I couldn't complete that action. Could you rephrase or provide more detail?"
+	}
+	cleaned := stripToolContent(content)
+	if strings.TrimSpace(cleaned) == "" {
+		return "I couldn't complete that action. Could you rephrase or provide more detail?"
+	}
+	return cleaned
+}
+
+// looksLikeToolCallJSON reports whether s is a JSON object with "name" and
+// "arguments" — i.e. a bare tool call the model emitted as text.
+func looksLikeToolCallJSON(s string) bool {
+	if len(s) == 0 || s[0] != '{' {
+		return false
+	}
+	var probe struct {
+		Name      json.RawMessage `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	return json.Unmarshal([]byte(s), &probe) == nil && len(probe.Name) > 0
+}
+
+// validateAgainstSchema is a minimal recursive JSON-Schema validator:
+// type, required, properties, items. Enough to catch GLM's common mistakes
+// (string where object expected, missing required fields). Not a full validator.
+func validateAgainstSchema(value interface{}, schema map[string]interface{}) error {
+	if t, ok := schema["type"].(string); ok && t != "" {
+		if err := checkJSONType(value, t); err != nil {
+			return err
+		}
+	}
+	switch v := value.(type) {
+	case map[string]interface{}:
+		if req, ok := schema["required"].([]interface{}); ok {
+			for _, r := range req {
+				if key, ok := r.(string); ok {
+					if _, exists := v[key]; !exists {
+						return fmt.Errorf("missing required field %q", key)
+					}
+				}
+			}
+		}
+		if props, ok := schema["properties"].(map[string]interface{}); ok {
+			for k, val := range v {
+				if propSchema, ok := props[k].(map[string]interface{}); ok {
+					if err := validateAgainstSchema(val, propSchema); err != nil {
+						return fmt.Errorf("field %q: %w", k, err)
+					}
+				}
+			}
+		}
+	case []interface{}:
+		if itemsSchema, ok := schema["items"].(map[string]interface{}); ok {
+			for i, item := range v {
+				if err := validateAgainstSchema(item, itemsSchema); err != nil {
+					return fmt.Errorf("item[%d]: %w", i, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func checkJSONType(value interface{}, t string) error {
+	switch t {
+	case "object":
+		if _, ok := value.(map[string]interface{}); !ok {
+			return fmt.Errorf("expected object")
+		}
+	case "array":
+		if _, ok := value.([]interface{}); !ok {
+			return fmt.Errorf("expected array")
+		}
+	case "string":
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("expected string")
+		}
+	case "number", "integer":
+		if _, ok := value.(float64); !ok {
+			return fmt.Errorf("expected number")
+		}
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("expected boolean")
+		}
+	}
 	return nil
 }
 
