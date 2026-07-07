@@ -22,7 +22,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .row:last-child { border-bottom: none; }
 .row-label { font-size: 13px; color: #8b949e; }
 .row-value { font-size: 13px; color: #e6edf3; font-weight: 500; }
-.badge { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.badge { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; cursor: pointer; transition: opacity .15s; user-select: none; }
+.badge:hover { opacity: .75; }
 .badge-green { background: #1a3a1a; color: #56d364; border: 1px solid #238636; }
 .badge-red   { background: #3a1a1a; color: #f85149; border: 1px solid #da3633; }
 .badge-gray  { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
@@ -65,12 +66,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
   <!-- Features -->
   <div class="card">
-    <div class="card-title">Features</div>
-    <div class="row"><span class="row-label">Web Search</span><span class="badge badge-gray" id="featSearch">OFF</span></div>
-    <div class="row"><span class="row-label">Thinking</span><span class="badge badge-gray" id="featThink">OFF</span></div>
-    <div class="row"><span class="row-label">Image Gen</span><span class="badge badge-gray" id="featImage">OFF</span></div>
-    <div class="row"><span class="row-label">Preview Mode</span><span class="badge badge-gray" id="featPreview">OFF</span></div>
-    <div class="row"><span class="row-label">Persist History</span><span class="badge badge-gray" id="featPersist">OFF</span></div>
+    <div class="card-title">Features <span style="font-size:10px;font-weight:400;color:#484f58;text-transform:none">(click to toggle)</span></div>
+    <div class="row"><span class="row-label">Web Search</span><span class="badge badge-gray" id="featSearch" onclick="toggleFeat('webSearch',this)">OFF</span></div>
+    <div class="row"><span class="row-label">Thinking</span><span class="badge badge-gray" id="featThink" onclick="toggleFeat('thinking',this)">OFF</span></div>
+    <div class="row"><span class="row-label">Image Gen</span><span class="badge badge-gray" id="featImage" onclick="toggleFeat('imageGen',this)">OFF</span></div>
+    <div class="row"><span class="row-label">Preview Mode</span><span class="badge badge-gray" id="featPreview" onclick="toggleFeat('previewMode',this)">OFF</span></div>
+    <div class="row"><span class="row-label">Persist History</span><span class="badge badge-gray" id="featPersist" onclick="toggleFeat('persistHistory',this)">OFF</span></div>
   </div>
 
   <!-- API Endpoints -->
@@ -176,6 +177,18 @@ async function refresh() {
     setFeature('featPreview', f.previewMode);
     setFeature('featPersist', f.persistHistory);
   } catch(e) { console.error('dashboard refresh error:', e); }
+}
+
+function toggleFeat(key, el) {
+  var isOn = el.textContent === 'ON';
+  var body = {}; body[key] = !isOn;
+  fetch('/features', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','Authorization':'Bearer __AUTH_TOKEN__'},
+    body: JSON.stringify(body)
+  }).then(function(r){return r.json()}).then(function(d){
+    if(d.success) refresh();
+  }).catch(function(e){console.error('toggle error:',e)});
 }
 
 refresh();

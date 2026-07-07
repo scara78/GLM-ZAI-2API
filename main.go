@@ -873,7 +873,7 @@ func printBanner() {
 	fmt.Println(yellow + "  📧 Telegram:" + reset + " https://t.me/D3_vin")
 	fmt.Println(magenta + "  👤 Author:" + reset + " @D3vin_dev")
 	fmt.Println(green + "  🔗 GitHub:" + reset + " https://github.com/D3-vin/GLM-ZAI-2API")
-	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.0")
+	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.2")
 	fmt.Println()
 }
 

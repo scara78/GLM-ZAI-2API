@@ -1,4 +1,4 @@
-module glm-free-api
+module glm-zai-2api
 
 go 1.26
 
