@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	_ "modernc.org/sqlite"
@@ -93,10 +94,28 @@ func main() {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
+	// Listen for any JavaScript dialogs (like beforeunload) and automatically accept them
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		if _, ok := ev.(*page.EventJavascriptDialogOpening); ok {
+			go chromedp.Run(ctx, page.HandleJavaScriptDialog(true))
+		}
+	})
+
 	var success bool
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		fmt.Printf("\nAttempt %d of %d\n", attempt, maxRetries)
+
+		// On retry, try to clear the chat input before navigating,
+		// which acts as a secondary measure against "unsaved changes" warnings.
+		if attempt > 1 {
+			chromedp.Run(ctx, chromedp.Evaluate(`
+				var input = document.querySelector("#chat-input");
+				if (input) {
+					input.value = "";
+				}
+			`, nil))
+		}
 
 		err := tryCollect(ctx, count, outPath)
 		if err != nil {
@@ -194,12 +213,25 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 		return fmt.Errorf("token collection failed: %w", err)
 	}
 
+	// Filter out empty or invalid tokens
+	var validTokens []string
+	for _, tok := range tokens {
+		tok = strings.TrimSpace(tok)
+		if tok != "" && tok != "null" && tok != "undefined" {
+			validTokens = append(validTokens, tok)
+		}
+	}
+
+	if len(validTokens) == 0 {
+		return fmt.Errorf("no valid tokens collected (received empty values)")
+	}
+
 	elapsed := time.Since(t0).Seconds()
-	fmt.Printf("  Collected %d tokens in %.2fs\n", len(tokens), elapsed)
+	fmt.Printf("  Collected %d valid tokens in %.2fs\n", len(validTokens), elapsed)
 
 	// Save to SQLite
 	fmt.Println("  Building SQLite database...")
-	if err := saveTokens(outPath, tokens); err != nil {
+	if err := saveTokens(outPath, validTokens); err != nil {
 		return fmt.Errorf("save failed: %w", err)
 	}
 

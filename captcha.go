@@ -495,11 +495,11 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
 			}
 			return base64.StdEncoding.EncodeToString(fpJSON), nil
 		}
-		captchaLog("VerifyCaptchaV3 succeeded but securityToken/certifyId empty for deviceToken=" + deviceToken)
+		captchaLog("VerifyCaptchaV3 succeeded but securityToken/certifyId empty for deviceToken=" + truncateToken(deviceToken))
 	} else if respJSON.Success {
-		captchaLog("deviceToken failed verification (VerifyResult=false): " + deviceToken)
+		captchaLog("deviceToken failed verification (VerifyResult=false): " + truncateToken(deviceToken))
 	} else {
-		captchaLog("VerifyCaptchaV3 request unsuccessful for deviceToken=" + deviceToken + " response=" + resp)
+		captchaLog("VerifyCaptchaV3 request unsuccessful for deviceToken=" + truncateToken(deviceToken) + " response=" + resp)
 	}
 	return "", nil
 }
@@ -520,17 +520,17 @@ func computeCaptchaParam(tokenStore *TokenStore) string {
 			captchaLog(fmt.Sprintf("No device tokens remaining (attempt %d/%d)", attempt+1, captchaMaxRetries))
 			return ""
 		}
-		captchaLog(fmt.Sprintf("Attempt %d/%d using deviceToken=%s", attempt+1, captchaMaxRetries, deviceToken))
+		captchaLog(fmt.Sprintf("Attempt %d/%d using deviceToken=%s", attempt+1, captchaMaxRetries, truncateToken(deviceToken)))
 
 		payload, err := tryComputeCaptcha(tokenStore, deviceToken)
 		if err != nil {
-			captchaLog(fmt.Sprintf("Attempt %d failed for deviceToken=%s: %v", attempt+1, deviceToken, err))
+			captchaLog(fmt.Sprintf("Attempt %d failed for deviceToken=%s: %v", attempt+1, truncateToken(deviceToken), err))
 			continue
 		}
 		if payload != "" {
 			return payload
 		}
-		captchaLog("deviceToken=" + deviceToken + " produced empty payload, retrying")
+		captchaLog("deviceToken=" + truncateToken(deviceToken) + " produced empty payload, retrying")
 	}
 	captchaLog(fmt.Sprintf("All %d token retries exhausted", captchaMaxRetries))
 	return ""
@@ -574,6 +574,14 @@ func tryComputeCaptcha(tokenStore *TokenStore, deviceToken string) (string, erro
 		return "", fmt.Errorf("verifyCaptcha: %w", err)
 	}
 	return payload, nil
+}
+
+// truncateToken returns first 10 + ... + last 10 chars for log readability.
+func truncateToken(s string) string {
+	if len(s) <= 23 {
+		return s
+	}
+	return s[:10] + "..." + s[len(s)-10:]
 }
 
 // captchaLog is a thin wrapper — verbose flag gates output.

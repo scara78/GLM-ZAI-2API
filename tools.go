@@ -135,6 +135,11 @@ func parseToolCalls(content string, tools []json.RawMessage) []parsedToolCall {
 		return calls
 	}
 
+	// Strategy 2b: Embedded JSON — model wrapped tool call in text/code fences without json tag
+	if calls := filterValidCalls(dedupCalls(parseEmbeddedJSON(content)), schemas); len(calls) > 0 {
+		return calls
+	}
+
 	// Strategy 3: Multi-line JSON (one tool call per line)
 	if calls := filterValidCalls(dedupCalls(parseMultilineJSON(content)), schemas); len(calls) > 0 {
 		return calls
@@ -170,20 +175,14 @@ func buildSchemaMap(tools []json.RawMessage) map[string]map[string]interface{} {
 	return m
 }
 
-// filterValidCalls drops tool calls whose arguments violate the tool's schema.
-// GLM emits schema-violating JSON often; forwarding it makes the client reject
-// with SchemaError. Dropping → the response falls back to plain text.
-// Each drop is logged so mis-drops of valid calls are visible.
+// filterValidCalls drops tool calls with unknown names or invalid JSON arguments.
+// Schema mismatches are logged but the call is still forwarded — the client
+// does its own validation and GLM's schemas are often slightly off.
 func filterValidCalls(calls []parsedToolCall, schemas map[string]map[string]interface{}) []parsedToolCall {
 	var valid []parsedToolCall
 	for _, c := range calls {
-		schema, ok := schemas[c.Function.Name]
-		if !ok {
+		if _, ok := schemas[c.Function.Name]; !ok {
 			log.Printf("[Tools] drop %q: unknown tool name", c.Function.Name)
-			continue
-		}
-		if schema == nil {
-			valid = append(valid, c) // no params → accept
 			continue
 		}
 		var args interface{}
@@ -191,9 +190,10 @@ func filterValidCalls(calls []parsedToolCall, schemas map[string]map[string]inte
 			log.Printf("[Tools] drop %q: arguments not valid JSON: %v", c.Function.Name, err)
 			continue
 		}
-		if verr := validateAgainstSchema(args, schema); verr != nil {
-			log.Printf("[Tools] drop %q: invalid args: %v", c.Function.Name, verr)
-			continue
+		if schema := schemas[c.Function.Name]; schema != nil {
+			if verr := validateAgainstSchema(args, schema); verr != nil {
+				log.Printf("[Tools] schema mismatch for %q (forwarding): %v", c.Function.Name, verr)
+			}
 		}
 		valid = append(valid, c)
 	}
@@ -358,6 +358,27 @@ func parseDirectJSON(content string) []parsedToolCall {
 	return nil
 }
 
+// parseEmbeddedJSON extracts a JSON tool call that the model wrapped in text
+// or plain code fences (``` without json tag). Finds the first { and last },
+// then tries to parse the substring as a tool call.
+func parseEmbeddedJSON(content string) []parsedToolCall {
+	first := strings.IndexByte(content, '{')
+	if first < 0 {
+		return nil
+	}
+	last := strings.LastIndexByte(content, '}')
+	if last <= first {
+		return nil
+	}
+	// ponytail: naive first-{ to last-} extraction; fails if content has multiple
+	// JSON objects with trailing text, but covers the common single-call case.
+	extracted := content[first : last+1]
+	if extracted == strings.TrimSpace(content) {
+		return nil // parseDirectJSON already tried the full content
+	}
+	return parseDirectJSON(extracted)
+}
+
 // parseMultilineJSON handles one JSON object per line
 func parseMultilineJSON(content string) []parsedToolCall {
 	lines := strings.Split(strings.TrimSpace(content), "\n")
@@ -367,19 +388,40 @@ func parseMultilineJSON(content string) []parsedToolCall {
 		if line == "" {
 			continue
 		}
-		var call struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(line), &call); err == nil && call.Name != "" && call.Name != "__done__" {
-			args := string(call.Arguments)
-			if !json.Valid(call.Arguments) {
-				args = "{}"
+		cleanLine := line
+		for len(cleanLine) > 0 && (cleanLine[len(cleanLine)-1] == '}' || cleanLine[len(cleanLine)-1] == '`') {
+			var generic map[string]interface{}
+			if err := json.Unmarshal([]byte(cleanLine), &generic); err == nil {
+				if nameRaw, ok := generic["name"].(string); ok && nameRaw != "" && nameRaw != "__done__" {
+					var argsStr string
+					if argsRaw, ok := generic["arguments"]; ok {
+						if argsMap, isMap := argsRaw.(map[string]interface{}); isMap {
+							argsBytes, _ := json.Marshal(argsMap)
+							argsStr = string(argsBytes)
+						} else if argsString, isString := argsRaw.(string); isString {
+							argsStr = argsString
+						}
+					}
+
+					if argsStr == "" {
+						delete(generic, "name")
+						delete(generic, "type")
+						argsBytes, _ := json.Marshal(generic)
+						argsStr = string(argsBytes)
+					}
+					if argsStr == "" || argsStr == "null" {
+						argsStr = "{}"
+					}
+
+					calls = append(calls, parsedToolCall{Type: "function", Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: nameRaw, Arguments: argsStr}})
+
+					break
+				}
 			}
-			calls = append(calls, parsedToolCall{Type: "function", Function: struct {
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			}{Name: call.Name, Arguments: args}})
+			cleanLine = cleanLine[:len(cleanLine)-1]
 		}
 	}
 	return calls

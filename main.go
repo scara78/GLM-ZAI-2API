@@ -505,9 +505,9 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 
-	// No tool calls found — clean any raw tool-call JSON so the user sees
-	// readable text instead of a JSON dump.
-	content = cleanFallbackContent(content)
+	// No tool calls found — return content as-is (text or raw JSON).
+	// Previously cleanFallbackContent replaced JSON with a generic message,
+	// but that hid legitimate text responses from the user.
 	if req.streamEnabled() {
 		// Client expects SSE — send text as stream chunks
 		flusher, ok := w.(http.Flusher)
@@ -522,16 +522,24 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(200)
 
-		// Send content as a single delta chunk
-		chunk := newChunk(content, model, requestID, nil)
-		chunkData, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", chunkData)
-		flusher.Flush()
+		writeSSE := func(v interface{}) {
+			data, _ := json.Marshal(v)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		// Split content into chunks to avoid oversized SSE events
+		const chunkSize = 2000
+		for i := 0; i < len(content); i += chunkSize {
+			end := i + chunkSize
+			if end > len(content) {
+				end = len(content)
+			}
+			writeSSE(newChunk(content[i:end], model, requestID, nil))
+		}
 
 		// Final chunk with finish_reason
-		final := newChunk("", model, requestID, strPtr("stop"))
-		finalData, _ := json.Marshal(final)
-		fmt.Fprintf(w, "data: %s\n\n", finalData)
+		writeSSE(newChunk("", model, requestID, strPtr("stop")))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	} else {
@@ -539,7 +547,11 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(newCompletion(content, prompt, model, requestID))
 	}
-	log.Printf("[Tools] No tool calls in response, returning text (%d chars)", len(content))
+	preview := content
+	if len(preview) > 500 {
+		preview = preview[:500] + "..."
+	}
+	log.Printf("[Tools] No tool calls in response, returning text (%d chars): %s", len(content), preview)
 }
 
 // writeToolCallsJSON writes a non-streaming JSON response with tool_calls.
@@ -873,7 +885,7 @@ func printBanner() {
 	fmt.Println(yellow + "  📧 Telegram:" + reset + " https://t.me/D3_vin")
 	fmt.Println(magenta + "  👤 Author:" + reset + " @D3vin_dev")
 	fmt.Println(green + "  🔗 GitHub:" + reset + " https://github.com/D3-vin/GLM-ZAI-2API")
-	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.2")
+	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.3")
 	fmt.Println()
 }
 
