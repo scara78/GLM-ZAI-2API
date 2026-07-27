@@ -1,5 +1,6 @@
 .git
-.gitignore
+.env
 *.md
-tokens.sqlite
-data/
+token-collector/
+.dockerignore
+.gitignore

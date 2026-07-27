@@ -1,5 +1,4 @@
 // main.go — HTTP server, config, OpenAI-compatible routes, dashboard.
-// Replaces main.js (Express) entirely. Captcha logic is in-process (no pipe IPC).
 package main
 
 import (
@@ -13,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -75,7 +75,72 @@ var httpClient = &http.Client{
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   true,
 	},
-	// No overall timeout — streaming requests need long-lived connections.
+}
+
+// ── Collector state (singleton — only one collection at a time) ──
+
+type collectorState struct {
+	mu      sync.Mutex
+	running bool
+	logs    []string
+	cancel  context.CancelFunc
+}
+
+var collector = &collectorState{}
+
+func (c *collectorState) start(count int, dbPath string, onDone func()) (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		return false, "Collection already in progress"
+	}
+	c.running = true
+	c.logs = []string{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	c.cancel = cancel
+
+	go func() {
+		defer func() {
+			cancel()
+			c.mu.Lock()
+			c.running = false
+			c.cancel = nil
+			c.mu.Unlock()
+			if onDone != nil {
+				onDone()
+			}
+		}()
+		err := CollectTokens(ctx, count, dbPath, func(msg string) {
+			c.mu.Lock()
+			c.logs = append(c.logs, msg)
+			c.mu.Unlock()
+			log.Printf("[Collector] %s", msg)
+		})
+		if err != nil {
+			c.mu.Lock()
+			c.logs = append(c.logs, "ERROR: "+err.Error())
+			c.mu.Unlock()
+			log.Printf("[Collector] Error: %v", err)
+		}
+	}()
+	return true, ""
+}
+
+func (c *collectorState) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
+
+func (c *collectorState) snapshot() (running bool, logs []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	logsCopy := make([]string, len(c.logs))
+	copy(logsCopy, c.logs)
+	return c.running, logsCopy
 }
 
 // ── Server ──
@@ -187,12 +252,23 @@ type chatRequest struct {
 
 func (r *chatRequest) streamEnabled() bool {
 	if r.Stream == nil {
-		return true // default stream=true like the original
+		return true
 	}
 	return *r.Stream
 }
 
 // ── Middleware ──
+
+// extractToken gets the bearer token from Authorization header OR ?auth= query param.
+// The query param is needed for EventSource (SSE) which cannot set custom headers.
+func extractToken(r *http.Request) string {
+	// Header first
+	if h := r.Header.Get("Authorization"); h != "" {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	// Query param fallback (for SSE EventSource)
+	return r.URL.Query().Get("auth")
+}
 
 func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +276,7 @@ func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 			h(w, r)
 			return
 		}
-		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		provided = strings.TrimSpace(provided)
+		provided := extractToken(r)
 		if provided != s.cfg.AuthToken {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(401)
@@ -252,13 +327,130 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/admin/session/clear", s.withAuth(s.handleSessionClear))
 	mux.HandleFunc("/admin/clients/", s.withAuth(s.handleClientClear))
 
+	// Token collector
+	mux.HandleFunc("/admin/collect-tokens", s.withAuth(s.handleCollectTokens))
+	mux.HandleFunc("/admin/collect-tokens/stop", s.withAuth(s.handleCollectTokensStop))
+	mux.HandleFunc("/admin/collect-tokens/stream", s.withAuth(s.handleCollectTokensStream))
+
 	mux.HandleFunc("/inject.js", s.handleInject)
 	mux.HandleFunc("/stop", s.withAuth(s.handleStop))
 
 	return corsMiddleware(mux)
 }
 
-// ── Handlers ──
+// ── Collector handlers ──
+
+func (s *Server) handleCollectTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		running, logs := collector.snapshot()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"running":    running,
+			"logs":       logs,
+			"tokenCount": s.tokens.Count(),
+		})
+		return
+	}
+
+	var body struct {
+		Count int `json:"count"`
+	}
+	body.Count = collectorDefaultTokens
+	json.NewDecoder(r.Body).Decode(&body)
+
+	if body.Count <= 0 {
+		body.Count = collectorDefaultTokens
+	}
+	if body.Count > collectorMaxTokens {
+		body.Count = collectorMaxTokens
+	}
+
+	dbPath := s.cfg.DBPath
+
+	ok, msg := collector.start(body.Count, dbPath, func() {
+		// Reload token store after collection finishes
+		if ts, err := OpenTokenStore(dbPath); err == nil {
+			s.tokens = ts
+			log.Printf("[Collector] Token store reloaded: %d tokens", ts.Count())
+		}
+	})
+
+	if !ok {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": msg})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"started": true,
+		"count":   body.Count,
+		"dbPath":  dbPath,
+	})
+}
+
+func (s *Server) handleCollectTokensStop(w http.ResponseWriter, r *http.Request) {
+	collector.stop()
+	json.NewEncoder(w).Encode(map[string]interface{}{"stopped": true})
+}
+
+func (s *Server) handleCollectTokensStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(200)
+
+	sendEvent := func(data string) {
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// Drain existing logs immediately
+	_, logs := collector.snapshot()
+	for _, l := range logs {
+		b, _ := json.Marshal(map[string]string{"log": l})
+		sendEvent(string(b))
+	}
+	sent := len(logs)
+
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			running, logs := collector.snapshot()
+
+			// Send new log lines
+			for i := sent; i < len(logs); i++ {
+				b, _ := json.Marshal(map[string]string{"log": logs[i]})
+				sendEvent(string(b))
+			}
+			sent = len(logs)
+
+			// Send status heartbeat
+			b, _ := json.Marshal(map[string]interface{}{
+				"running":    running,
+				"tokenCount": s.tokens.Count(),
+			})
+			sendEvent(string(b))
+
+			if !running && sent > 0 {
+				sendEvent(`{"done":true}`)
+				return
+			}
+		}
+	}
+}
+
+// ── Standard handlers ──
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -281,16 +473,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if !init {
 		userID = ""
 	}
+	running, _ := collector.snapshot()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"connected":      init,
-		"userName":       userName,
-		"userId":         userID,
-		"feVersion":      feVersion,
-		"activeSessions": s.conversations.count(),
-		"features":       features,
-		"mode":           "direct",
-		"port":           s.cfg.Port,
-		"tokenCount":     s.tokens.Count(),
+		"connected":        init,
+		"userName":         userName,
+		"userId":           userID,
+		"feVersion":        feVersion,
+		"activeSessions":   s.conversations.count(),
+		"features":         features,
+		"mode":             "direct",
+		"port":             s.cfg.Port,
+		"tokenCount":       s.tokens.Count(),
+		"collectorRunning": running,
 	})
 }
 
@@ -320,7 +514,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	// Limit body size (50mb like the original)
 	r.Body = http.MaxBytesReader(w, r.Body, 50*1024*1024)
 
 	var req chatRequest
@@ -354,8 +547,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	prompt := messagesToPrompt(req.Messages)
 	features := s.zaiSession.getFeatures()
 
-	// Tool calling adapter: if request has tools, convert them to system prompt
-	// and use non-streaming internally (need full response to parse tool calls)
 	if len(req.Tools) > 0 {
 		s.handleChatWithTools(w, r, req, prompt, model, requestID, conv, features)
 		return
@@ -379,13 +570,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleChatWithTools processes requests with tools (function calling).
-// Internally uses non-streaming: buffers full response, parses for <<TOOL>> tags,
-// returns either tool_calls or normal text in OpenAI format.
 func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req chatRequest, prompt, model, requestID string, conv *Conversation, features Features) {
-	// Convert messages: prepend tools system prompt, convert tool/assistant roles
 	convertedMsgs := convertToolMessages(req.Messages, req.Tools)
-	// Recompute prompt from converted messages for signature
 	convertedPrompt := messagesToPrompt(convertedMsgs)
 
 	opts := sendOpts{
@@ -420,13 +606,10 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 	}
 
 	content := fullContent.String()
-
-	// Parse for tool calls
 	toolCalls := parseToolCalls(content, req.Tools)
 	if len(toolCalls) > 0 {
 		cleanContent := stripToolContent(content)
 
-		// Build tool call entries
 		type tcFunc struct {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
@@ -446,7 +629,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		}
 
 		if req.streamEnabled() {
-			// SSE streaming format for tool_calls (what opencode/OpenAI clients expect)
 			flusher, ok := w.(http.Flusher)
 			if !ok {
 				w.Header().Set("Content-Type", "application/json")
@@ -459,7 +641,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(200)
 
-			// Chunk 1: role + tool_calls
 			chunk1 := map[string]interface{}{
 				"id":      "chatcmpl-" + requestID,
 				"object":  "chat.completion.chunk",
@@ -479,7 +660,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 			fmt.Fprintf(w, "data: %s\n\n", data1)
 			flusher.Flush()
 
-			// Chunk 2: finish_reason
 			finish := "tool_calls"
 			chunk2 := map[string]interface{}{
 				"id":      "chatcmpl-" + requestID,
@@ -497,7 +677,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 		} else {
-			// Non-streaming JSON
 			w.Header().Set("Content-Type", "application/json")
 			writeToolCallsJSON(w, requestID, model, cleanContent, entries)
 		}
@@ -505,9 +684,7 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 
-	// No tool calls found — return content as-is (text or raw JSON).
 	if req.streamEnabled() {
-		// Client expects SSE — send text as stream chunks
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			w.Header().Set("Content-Type", "application/json")
@@ -526,7 +703,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 			flusher.Flush()
 		}
 
-		// Split content into chunks to avoid oversized SSE events
 		const chunkSize = 2000
 		for i := 0; i < len(content); i += chunkSize {
 			end := i + chunkSize
@@ -535,24 +711,15 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 			}
 			writeSSE(newChunk(content[i:end], model, requestID, nil))
 		}
-
-		// Final chunk with finish_reason
 		writeSSE(newChunk("", model, requestID, strPtr("stop")))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	} else {
-		// Non-streaming JSON
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(newCompletion(content, prompt, model, requestID))
 	}
-	preview := content
-	if len(preview) > 500 {
-		preview = preview[:500] + "..."
-	}
-	log.Printf("[Tools] No tool calls in response, returning text (%d chars): %s", len(content), preview)
 }
 
-// writeToolCallsJSON writes a non-streaming JSON response with tool_calls.
 func writeToolCallsJSON(w http.ResponseWriter, requestID, model, content string, entries interface{}) {
 	resp := map[string]interface{}{
 		"id":      "chatcmpl-" + requestID,
@@ -592,10 +759,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request, prompt
 		flusher.Flush()
 	}
 
-	// Initial chunk
 	writeSSE(newChunk("", model, requestID, nil))
 
-	// Keepalive ticker
 	keepAlive := time.NewTicker(5 * time.Second)
 	defer keepAlive.Stop()
 	go func() {
@@ -625,12 +790,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request, prompt
 		fmt.Fprintf(w, "data: %s\n\n", errJSON)
 	}
 
-	// Final chunk
 	writeSSE(newChunk("", model, requestID, strPtr("stop")))
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 
-	// History persistence
 	if persist && err == nil {
 		p := prompt
 		if fullContent.Len() > 0 {
@@ -838,12 +1001,10 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// ── .env file loader (minimal: KEY=VALUE per line, # comments, quotes stripped) ──
-
 func loadEnvFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return // no .env file — that's fine
+		return
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -857,13 +1018,11 @@ func loadEnvFile(path string) {
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		val = strings.Trim(val, "`\"'")
-		if os.Getenv(key) == "" { // env vars take precedence over .env
+		if os.Getenv(key) == "" {
 			os.Setenv(key, val)
 		}
 	}
 }
-
-// ── Banner ──
 
 func printBanner() {
 	cyan := "\033[36m"
@@ -883,11 +1042,9 @@ func printBanner() {
 	fmt.Println(yellow + "  📧 Telegram:" + reset + " https://t.me/D3_vin")
 	fmt.Println(magenta + "  👤 Author:" + reset + " @D3vin_dev")
 	fmt.Println(green + "  🔗 GitHub:" + reset + " https://github.com/D3-vin/GLM-ZAI-2API")
-	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.3")
+	fmt.Println(cyan + "  📦 Version:" + reset + " 1.0.4")
 	fmt.Println()
 }
-
-// ── Main ──
 
 func main() {
 	var (
@@ -906,7 +1063,6 @@ func main() {
 	}
 	captchaVerbose = verbose
 
-	// Open (or create) token store — never fatal, server runs with 0 tokens.
 	tokenStore, err := OpenTokenStore(cfg.DBPath)
 	if err != nil {
 		log.Printf("[Startup] Token store unavailable (%v) — captcha disabled", err)
@@ -928,12 +1084,11 @@ func main() {
 		tokens:        tokenStore,
 	}
 
-	// Startup banner
 	printBanner()
 
 	tokenStatus := fmt.Sprintf("%d tokens", tokenCount)
 	if tokenCount == 0 {
-		tokenStatus = "0 tokens (run token-collector to populate)"
+		tokenStatus = "0 tokens (use dashboard to collect)"
 	}
 	fmt.Printf(`
 ╔═══════════════════════════════════════════════════════════════╗
@@ -949,10 +1104,9 @@ func main() {
 		fmt.Sprintf("%s (%s)", cfg.DBPath, tokenStatus),
 		cfg.AuthToken)
 
-	// Initialize session (non-blocking on failure — will retry on first request)
 	go func() {
 		if err := srv.zaiSession.initialize(cfg.ZAIToken); err != nil {
-			log.Printf("[Startup] Session init deferred — will retry on first request: %v", err)
+			log.Printf("[Startup] Session init deferred: %v", err)
 		}
 	}()
 
@@ -965,19 +1119,15 @@ func main() {
 	}
 }
 
-// waitForEnter pauses before exit so fatal errors stay visible in the
-// console window (e.g. when the .exe is double-clicked on Windows).
-// Skipped when stdin is piped/redirected, so automation isn't blocked.
 func waitForEnter() {
 	stat, err := os.Stdin.Stat()
 	if err != nil || (stat.Mode()&os.ModeCharDevice) == 0 {
-		return // not interactive (piped/redirected) — don't block
+		return
 	}
 	fmt.Fprintln(os.Stderr, "\nPress Enter to exit...")
 	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
-// readBody is a small helper for non-streaming body reads.
 func readBody(r io.Reader) string {
 	data, _ := io.ReadAll(r)
 	return string(data)
