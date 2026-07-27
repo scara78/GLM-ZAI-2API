@@ -4,11 +4,11 @@ RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-RUN go mod download
+COPY go.mod ./
+RUN go mod download || true
 
 COPY . .
-RUN go build -o server .
+RUN go mod tidy && go build -o server .
 
 FROM alpine:3.19
 
@@ -22,12 +22,10 @@ RUN apk add --no-cache \
     font-noto \
     font-noto-cjk
 
-ENV CHROME_PATH=/usr/bin/chromium-browser
-ENV CHROMEDP_NO_SANDBOX=true
+ENV CHROMIUM_PATH=/usr/bin/chromium-browser
 
 WORKDIR /app
 COPY --from=builder /app/server .
 
 EXPOSE 8080
-
 CMD ["./server"]
