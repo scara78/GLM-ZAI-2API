@@ -1,0 +1,32 @@
+{
+  "services": [
+    {
+      "type": "app",
+      "data": {
+        "name": "glm-zai-2api",
+        "source": {
+          "type": "image"
+        },
+        "build": {
+          "type": "dockerfile",
+          "file": "Dockerfile"
+        },
+        "ports": [
+          {
+            "published": 5082,
+            "target": 5082,
+            "protocol": "tcp"
+          }
+        ],
+        "mounts": [
+          {
+            "type": "volume",
+            "name": "data",
+            "mountPath": "/app/data"
+          }
+        ],
+        "env": "PORT=5082\nHOST=0.0.0.0\nAUTH_TOKEN=d3vin\nDB_PATH=/app/data/tokens.sqlite\nZAI_TOKEN=\nLOG_LEVEL=info"
+      }
+    }
+  ]
+}
