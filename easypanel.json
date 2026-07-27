@@ -27,6 +27,27 @@
         ],
         "env": "PORT=5082\nHOST=0.0.0.0\nAUTH_TOKEN=d3vin\nDB_PATH=/app/data/tokens.sqlite\nZAI_TOKEN=\nLOG_LEVEL=info"
       }
+    },
+    {
+      "type": "app",
+      "data": {
+        "name": "token-collector",
+        "source": {
+          "type": "image"
+        },
+        "build": {
+          "type": "dockerfile",
+          "file": "token-collector/Dockerfile"
+        },
+        "mounts": [
+          {
+            "type": "volume",
+            "name": "data",
+            "mountPath": "/app/data"
+          }
+        ],
+        "env": "COUNT=750\nOUT=/app/data/tokens.sqlite"
+      }
     }
   ]
 }

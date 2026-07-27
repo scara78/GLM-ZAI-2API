@@ -67,15 +67,20 @@ func main() {
 		}
 	})
 	if !countChanged {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Printf("How many tokens to collect? [default: %d, max: %d] ", defaultTokens, maxTokens)
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line != "" {
-			if n, err := strconv.Atoi(line); err == nil && n > 0 {
-				count = n
-				if count > maxTokens {
-					count = maxTokens
+		// Skip interactive prompt if stdin is not a terminal (Docker)
+		stat, err := os.Stdin.Stat()
+		isTerminal := err == nil && (stat.Mode()&os.ModeCharDevice) != 0
+		if isTerminal {
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Printf("How many tokens to collect? [default: %d, max: %d] ", defaultTokens, maxTokens)
+			line, _ := reader.ReadString('\n')
+			line = strings.TrimSpace(line)
+			if line != "" {
+				if n, err := strconv.Atoi(line); err == nil && n > 0 {
+					count = n
+					if count > maxTokens {
+						count = maxTokens
+					}
 				}
 			}
 		}
@@ -83,10 +88,18 @@ func main() {
 
 	fmt.Printf("\nCollecting %d tokens\n", count)
 
-	// Chrome allocator options
+	// Build Chrome allocator options
+	// Support CHROME_PATH env var (set in Docker to /usr/bin/chromium-browser)
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", headless),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-gpu", true),
 	)
+
+	if chromePath := os.Getenv("CHROME_PATH"); chromePath != "" {
+		opts = append(opts, chromedp.ExecPath(chromePath))
+	}
 
 	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
@@ -106,8 +119,6 @@ func main() {
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		fmt.Printf("\nAttempt %d of %d\n", attempt, maxRetries)
 
-		// On retry, try to clear the chat input before navigating,
-		// which acts as a secondary measure against "unsaved changes" warnings.
 		if attempt > 1 {
 			chromedp.Run(ctx, chromedp.Evaluate(`
 				var input = document.querySelector("#chat-input");
@@ -123,7 +134,6 @@ func main() {
 			if attempt == maxRetries {
 				fmt.Println("  All retries exhausted.")
 				log.Printf("Error: %v", err)
-				waitForEnter()
 				os.Exit(1)
 			}
 			fmt.Println("  Retrying with a fresh page load...")
@@ -135,7 +145,6 @@ func main() {
 
 	if !success {
 		fmt.Println("Failed after maximum retries.")
-		waitForEnter()
 		os.Exit(1)
 	}
 
@@ -143,7 +152,6 @@ func main() {
 }
 
 func tryCollect(ctx context.Context, total int, outPath string) error {
-	// Navigate to Z.AI
 	fmt.Println("  Navigating to chat.z.ai...")
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(zaiURL),
@@ -153,7 +161,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	}
 	fmt.Println("  Chat input found")
 
-	// Fill textarea and click send
 	if err := chromedp.Run(ctx,
 		chromedp.SendKeys(`#chat-input`, "__", chromedp.ByQuery),
 		chromedp.Click(`#send-message-button`, chromedp.ByQuery),
@@ -162,8 +169,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	}
 	fmt.Println("  Send clicked")
 
-	// Wait for window.z_um.getToken to be ready — the page injects the captcha
-	// SDK async after the first send, so a fixed sleep is flaky under load.
 	fmt.Println("  Waiting for token endpoint...")
 	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer waitCancel()
@@ -171,14 +176,12 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 		return fmt.Errorf("token endpoint not ready: %w", err)
 	}
 
-	// Collect tokens with timeout
 	fmt.Println("  Collecting tokens...")
 	collectCtx, cancel := context.WithTimeout(ctx, tokenCollectTimeout)
 	defer cancel()
 
 	t0 := time.Now()
 
-	// Single batch JS evaluation — calls window.z_um.getToken() in a loop
 	jsExpr := fmt.Sprintf(`(async () => {
 		const out = new Array(%d);
 		for (let i = 0; i < %d; i++) {
@@ -189,7 +192,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 		return out;
 	})()`, total, total)
 
-	// Use runtime.Evaluate with awaitPromise + returnByValue
 	var tokens []string
 	err := chromedp.Run(collectCtx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
@@ -213,7 +215,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 		return fmt.Errorf("token collection failed: %w", err)
 	}
 
-	// Filter out empty or invalid tokens
 	var validTokens []string
 	for _, tok := range tokens {
 		tok = strings.TrimSpace(tok)
@@ -229,7 +230,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	elapsed := time.Since(t0).Seconds()
 	fmt.Printf("  Collected %d valid tokens in %.2fs\n", len(validTokens), elapsed)
 
-	// Save to SQLite
 	fmt.Println("  Building SQLite database...")
 	if err := saveTokens(outPath, validTokens); err != nil {
 		return fmt.Errorf("save failed: %w", err)
@@ -245,9 +245,6 @@ func tryCollect(ctx context.Context, total int, outPath string) error {
 	return nil
 }
 
-// waitForZUM polls until window.z_um.getToken is defined. Z.AI injects the
-// captcha SDK async after the first send; a fixed sleep misses it under load.
-// ponytail: 500ms poll — z_um appears in ~2-5s; 30s deadline (caller) is the ceiling.
 func waitForZUM(ctx context.Context) error {
 	for {
 		var ready bool
@@ -267,9 +264,7 @@ func waitForZUM(ctx context.Context) error {
 	}
 }
 
-// saveTokens creates a SQLite database with the collected tokens.
 func saveTokens(path string, tokens []string) error {
-	// Remove existing file to start fresh
 	os.Remove(path)
 
 	db, err := sql.Open("sqlite", path)
@@ -302,16 +297,4 @@ func saveTokens(path string, tokens []string) error {
 	}
 
 	return tx.Commit()
-}
-
-// waitForEnter pauses before exit so fatal errors stay visible in the
-// console window (e.g. when the .exe is double-clicked on Windows).
-// Skipped when stdin is piped/redirected, so automation isn't blocked.
-func waitForEnter() {
-	stat, err := os.Stdin.Stat()
-	if err != nil || (stat.Mode()&os.ModeCharDevice) == 0 {
-		return // not interactive (piped/redirected) — don't block
-	}
-	fmt.Fprintln(os.Stderr, "\nPress Enter to exit...")
-	bufio.NewReader(os.Stdin).ReadString('\n')
 }
