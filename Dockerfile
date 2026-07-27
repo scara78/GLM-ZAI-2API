@@ -1,55 +1,33 @@
-# ── Stage 1: Build ──────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /app
-
-# Build deps (gcc needed for cgo sqlite fallback, but we use modernc pure-Go)
-RUN apk add --no-cache git
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+RUN go build -o server .
 
-# Build main binary (pure Go — no CGO needed)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o app .
-
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM alpine:3.19
 
-WORKDIR /app
-
-# Chromium + runtime deps for headless browser (token collector)
 RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
     chromium \
-    chromium-chromedriver \
     nss \
     freetype \
     harfbuzz \
+    ca-certificates \
     ttf-freefont \
     font-noto \
-    dbus \
-    udev
+    font-noto-cjk
 
-# Tell collector where Chromium lives
 ENV CHROME_PATH=/usr/bin/chromium-browser
+ENV CHROMEDP_NO_SANDBOX=true
 
-# Server config defaults
-ENV HOST=0.0.0.0
-ENV PORT=5082
-ENV DB_PATH=/app/data/tokens.sqlite
+WORKDIR /app
+COPY --from=builder /app/server .
 
-# Chromium sandbox workaround for Docker (no-sandbox flag set in code)
-ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+EXPOSE 8080
 
-RUN mkdir -p /app/data
-
-COPY --from=builder /app/app /app/app
-
-EXPOSE 5082
-
-VOLUME ["/app/data"]
-
-CMD ["/app/app"]
+CMD ["./server"]
