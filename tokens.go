@@ -1,12 +1,10 @@
 // tokens.go — SQLite-backed device-token store for captcha verification.
-// Replaces the globalDB + dbMu pattern from the original token-helper.
 package main
 
 import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -17,16 +15,27 @@ type TokenStore struct {
 	db *sql.DB
 }
 
+// OpenTokenStore opens (or creates) the token database at dbPath.
+// If the file does not exist it is created with the correct schema so the
+// server starts cleanly even before any tokens have been collected.
 func OpenTokenStore(dbPath string) (*TokenStore, error) {
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, fmt.Errorf("token database not found: %s", dbPath)
-	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open token store %s: %w", dbPath, err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+
+	// Ensure the tokens table exists (idempotent).
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tokens (
+		id    INTEGER PRIMARY KEY AUTOINCREMENT,
+		token TEXT    NOT NULL UNIQUE
+	);`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init token store schema: %w", err)
+	}
+
 	return &TokenStore{db: db}, nil
 }
 

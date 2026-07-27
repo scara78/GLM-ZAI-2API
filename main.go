@@ -41,7 +41,7 @@ func loadConfig() *Config {
 		LogLevel:       envOr("LOG_LEVEL", "debug"),
 		LogFormat:      envOr("LOG_FORMAT", "text"),
 		Timeout:        time.Duration(envIntOr("TIMEOUT", 300000)) * time.Millisecond,
-		DBPath:         envOr("DB_PATH", "tokens.sqlite"),
+		DBPath:         envOr("DB_PATH", "/app/data/tokens.sqlite"),
 		CaptchaTimeout: 90 * time.Second,
 	}
 	return cfg
@@ -506,8 +506,6 @@ func (s *Server) handleChatWithTools(w http.ResponseWriter, r *http.Request, req
 	}
 
 	// No tool calls found — return content as-is (text or raw JSON).
-	// Previously cleanFallbackContent replaced JSON with a generic message,
-	// but that hid legitimate text responses from the user.
 	if req.streamEnabled() {
 		// Client expects SSE — send text as stream chunks
 		flusher, ok := w.(http.Flusher)
@@ -908,14 +906,18 @@ func main() {
 	}
 	captchaVerbose = verbose
 
-	// Open token store
-	var tokenCount int
+	// Open (or create) token store — never fatal, server runs with 0 tokens.
 	tokenStore, err := OpenTokenStore(cfg.DBPath)
 	if err != nil {
-		log.Printf("[Startup] Token store: %v — captcha will fail until tokens.sqlite is available", err)
+		log.Printf("[Startup] Token store unavailable (%v) — captcha disabled", err)
 		tokenStore = nil
-	} else {
+	}
+	if tokenStore != nil {
 		defer tokenStore.Close()
+	}
+
+	tokenCount := 0
+	if tokenStore != nil {
 		tokenCount = tokenStore.Count()
 	}
 
@@ -928,6 +930,11 @@ func main() {
 
 	// Startup banner
 	printBanner()
+
+	tokenStatus := fmt.Sprintf("%d tokens", tokenCount)
+	if tokenCount == 0 {
+		tokenStatus = "0 tokens (run token-collector to populate)"
+	}
 	fmt.Printf(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║           GLM-ZAI-2API  (Go)                                  ║
@@ -935,10 +942,12 @@ func main() {
 ║  Mode:          DIRECT HTTP (no browser needed)               ║
 ║  Dashboard:     http://localhost:%s                          ║
 ║  OpenAI API:    http://localhost:%s/v1/chat/completions      ║
-║  Token DB:      %s (%d tokens)
+║  Token DB:      %s
 ║  Auth Token:    %s
 ╚═══════════════════════════════════════════════════════════════╝
-`, cfg.Port, cfg.Port, cfg.DBPath, tokenCount, cfg.AuthToken)
+`, cfg.Port, cfg.Port,
+		fmt.Sprintf("%s (%s)", cfg.DBPath, tokenStatus),
+		cfg.AuthToken)
 
 	// Initialize session (non-blocking on failure — will retry on first request)
 	go func() {
